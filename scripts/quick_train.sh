@@ -51,9 +51,14 @@ PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 # Change to project directory
 cd "$PROJECT_DIR"
 
-# Python command (use UV_RUN env var if set, otherwise python3)
+# Python command configuration
 # Usage: UV_RUN="uv run" ./scripts/quick_train.sh
-PYTHON="${UV_RUN:-python3}"
+# When UV_RUN is set, use "uv run python" for Python commands
+if [ -n "$UV_RUN" ]; then
+    PYTHON="uv run python"
+else
+    PYTHON="python3"
+fi
 
 echo -e "${BLUE}=============================================${NC}"
 echo -e "${BLUE}  VoxLM Quick Training${NC}"
@@ -127,15 +132,15 @@ log_step "Validating environment..."
 
 # Check Python
 # Check if using uv or direct python
-if [ "$UV_RUN" = "uv run" ]; then
+if [ -n "$UV_RUN" ]; then
     log_success "Using uv for Python"
-    PYTHON_VERSION=$($PYTHON python --version 2>&1 | cut -d' ' -f2)
+    PYTHON_VERSION=$($PYTHON --version 2>&1 | cut -d' ' -f2)
 else
     if ! command -v python3 &> /dev/null; then
         log_error "Python 3 not found. Please install Python 3.10+"
         exit 1
     fi
-    PYTHON_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+    PYTHON_VERSION=$($PYTHON -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 fi
 log_success "Python $PYTHON_VERSION"
 
