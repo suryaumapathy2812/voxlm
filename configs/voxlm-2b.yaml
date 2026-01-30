@@ -1,0 +1,76 @@
+# =============================================================================
+# VoxLM-2B Configuration
+# =============================================================================
+# Default balanced model: Whisper-small + Qwen2-1.5B
+# Good for development and testing. ~2B total parameters.
+#
+# Usage:
+#   ./scripts/quick_train.sh configs/voxlm-2b.yaml
+#   docker-compose run --rm voxlm configs/voxlm-2b.yaml
+# =============================================================================
+
+# Inherit from base config
+_base_: "base.yaml"
+
+# -----------------------------------------------------------------------------
+# Model Configuration
+# -----------------------------------------------------------------------------
+model:
+  name: "voxlm-2b"
+  
+  # Audio Encoder: Whisper Small (244M params)
+  audio_encoder: "openai/whisper-small"
+  audio_encoder_dim: 768
+  freeze_audio_encoder: true
+  
+  # LLM: Qwen2-1.5B
+  llm_model: "Qwen/Qwen2-1.5B"
+  llm_dim: 1536
+  freeze_llm: true
+  
+  # LoRA: Moderate size for good quality
+  use_lora: true
+  lora_r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  
+  # Alignment
+  alignment_num_layers: 2
+  alignment_num_heads: 8
+
+# -----------------------------------------------------------------------------
+# Training Configuration
+# -----------------------------------------------------------------------------
+training:
+  phase1:
+    epochs: 10
+    batch_size: 8
+    learning_rate: 1.0e-4
+    warmup_steps: 1000
+    gradient_accumulation: 1
+    
+  phase2:
+    epochs: 5
+    batch_size: 16
+    learning_rate: 5.0e-5
+    alignment_weight: 1.0
+
+# -----------------------------------------------------------------------------
+# Data Configuration
+# -----------------------------------------------------------------------------
+data:
+  data_dir: "./data"
+  train_split: "train-clean-100"
+  val_split: "dev-clean"
+  timestamps_dir: "./data/timestamps"
+  whisper_model: "small"
+  max_wer: 0.1
+
+# -----------------------------------------------------------------------------
+# Output Configuration
+# -----------------------------------------------------------------------------
+output:
+  checkpoint_dir: "./checkpoints"
+  final_model_dir: "./output/models"
+  use_wandb: false
+  wandb_project: "voxlm"

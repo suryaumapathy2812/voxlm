@@ -1,0 +1,96 @@
+# =============================================================================
+# VoxLM Docker Compose Configuration
+# =============================================================================
+# Easy GPU-enabled training with Docker Compose.
+#
+# Usage:
+#   # Build and run with default config (voxlm-2b)
+#   docker-compose up
+#
+#   # Run with specific config
+#   docker-compose run --rm voxlm configs/voxlm-9b-global.yaml
+#
+#   # Build only
+#   docker-compose build
+#
+#   # Run in background
+#   docker-compose up -d
+#
+#   # View logs
+#   docker-compose logs -f
+#
+#   # Stop
+#   docker-compose down
+# =============================================================================
+
+version: '3.8'
+
+services:
+  voxlm:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    
+    # Container name
+    container_name: voxlm-training
+    
+    # GPU support (requires nvidia-docker)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+    # Alternative GPU syntax (for older docker-compose)
+    # runtime: nvidia
+    
+    # Environment variables
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - CUDA_VISIBLE_DEVICES=0
+      - VOXLM_DATA_DIR=/app/data
+      - VOXLM_OUTPUT_DIR=/app/output
+      - VOXLM_CHECKPOINT_DIR=/app/checkpoints
+      # Uncomment for Weights & Biases logging
+      # - WANDB_API_KEY=${WANDB_API_KEY}
+    
+    # Volume mounts
+    volumes:
+      # Data directory (LibriSpeech, timestamps)
+      - ../data:/app/data
+      
+      # Output directory (final models)
+      - ../output:/app/output
+      
+      # Checkpoints (intermediate saves)
+      - ../checkpoints:/app/checkpoints
+      
+      # Mount configs for easy editing
+      - ../configs:/app/configs:ro
+      
+      # Optional: Mount HuggingFace cache to avoid re-downloading models
+      - ~/.cache/huggingface:/root/.cache/huggingface
+    
+    # Shared memory size (important for DataLoader workers)
+    shm_size: '16gb'
+    
+    # Keep container running for debugging
+    # stdin_open: true
+    # tty: true
+    
+    # Default command (config file)
+    command: ["configs/voxlm-2b.yaml"]
+
+  # Optional: TensorBoard service for monitoring
+  tensorboard:
+    image: tensorflow/tensorflow:latest
+    container_name: voxlm-tensorboard
+    ports:
+      - "6006:6006"
+    volumes:
+      - ../checkpoints:/logs
+    command: ["tensorboard", "--logdir=/logs", "--bind_all"]
+    profiles:
+      - monitoring

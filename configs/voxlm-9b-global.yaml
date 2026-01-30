@@ -1,0 +1,79 @@
+# =============================================================================
+# VoxLM-9B-Global Configuration
+# =============================================================================
+# Production model for 99 languages: Whisper-large-v3 + Qwen2.5-7B
+# Requires ~24GB VRAM. Use gradient accumulation on smaller GPUs.
+#
+# Usage:
+#   ./scripts/quick_train.sh configs/voxlm-9b-global.yaml
+#   python scripts/train.py --config configs/voxlm-9b-global.yaml
+# =============================================================================
+
+# Inherit from base config
+_base_: "base.yaml"
+
+# -----------------------------------------------------------------------------
+# Model Configuration
+# -----------------------------------------------------------------------------
+model:
+  name: "voxlm-9b-global"
+  
+  # Audio Encoder: Whisper Large V3 (1.5B params, 99 languages)
+  audio_encoder: "openai/whisper-large-v3"
+  audio_encoder_dim: 1280
+  freeze_audio_encoder: true
+  
+  # LLM: Qwen2.5-7B (excellent multilingual support)
+  llm_model: "Qwen/Qwen2.5-7B"
+  llm_dim: 3584
+  freeze_llm: true
+  
+  # LoRA: Larger for production quality
+  use_lora: true
+  lora_r: 32
+  lora_alpha: 64
+  lora_dropout: 0.05
+  
+  # Alignment
+  alignment_num_layers: 2
+  alignment_num_heads: 8
+
+# -----------------------------------------------------------------------------
+# Training Configuration
+# -----------------------------------------------------------------------------
+training:
+  phase1:
+    epochs: 10
+    batch_size: 4  # Smaller batch for large model
+    learning_rate: 1.0e-4
+    warmup_steps: 2000
+    gradient_accumulation: 4  # Effective batch = 16
+    
+  phase2:
+    epochs: 5
+    batch_size: 8
+    learning_rate: 5.0e-5
+    alignment_weight: 1.0
+  
+  # Enable compilation for production
+  compile_model: true
+
+# -----------------------------------------------------------------------------
+# Data Configuration
+# -----------------------------------------------------------------------------
+data:
+  data_dir: "./data"
+  train_split: "train-clean-100"  # Use larger splits for production
+  val_split: "dev-clean"
+  timestamps_dir: "./data/timestamps"
+  whisper_model: "large-v3"  # Match audio encoder
+  max_wer: 0.1
+
+# -----------------------------------------------------------------------------
+# Output Configuration
+# -----------------------------------------------------------------------------
+output:
+  checkpoint_dir: "./checkpoints"
+  final_model_dir: "./output/models"
+  use_wandb: true  # Enable for production tracking
+  wandb_project: "voxlm-production"
