@@ -308,6 +308,19 @@ class VoxLM(nn.Module):
             trust_remote_code=True,
         )
 
+        # CRITICAL FIX: Use separate pad token to ensure EOS is learned during training
+        #
+        # Problem: Qwen2 (and many LLMs) use eos_token as pad_token by default.
+        # In our loss computation, we do: ignore_index=pad_token_id
+        # This means EOS is ALSO ignored, so the model never learns to stop!
+        #
+        # Solution: Use a different token for padding (<|fim_pad|> exists in Qwen2)
+        # This ensures EOS tokens in the training labels contribute to the loss,
+        # teaching the model to generate EOS when transcription is complete.
+        if self.tokenizer.pad_token_id == self.tokenizer.eos_token_id:
+            # Use fim_pad token which exists in Qwen2 tokenizers (ID 151662)
+            self.tokenizer.pad_token = "<|fim_pad|>"
+
         # Add special tokens
         special_tokens = {
             "additional_special_tokens": [

@@ -573,6 +573,22 @@ def main():
     print("Phase 1 model loaded!")
     model.print_trainable_parameters()
 
+    # Verify tokenizer setup for EOS learning
+    # CRITICAL: pad_token must be different from eos_token for EOS to be learned
+    print(f"\nTokenizer setup:")
+    print(
+        f"  eos_token: {repr(model.tokenizer.eos_token)} (id={model.tokenizer.eos_token_id})"
+    )
+    print(
+        f"  pad_token: {repr(model.tokenizer.pad_token)} (id={model.tokenizer.pad_token_id})"
+    )
+    if model.tokenizer.pad_token_id == model.tokenizer.eos_token_id:
+        print(
+            "  WARNING: pad_token == eos_token! Model will NOT learn to generate EOS!"
+        )
+    else:
+        print("  OK: pad_token != eos_token - Model will learn to generate EOS")
+
     # Load datasets
     print(f"\nLoading timestamp datasets...")
     print(f"  Train: {timestamps_path}")

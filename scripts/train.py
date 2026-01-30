@@ -673,7 +673,23 @@ def main():
     model = VoxLM(model_config)
     model.print_trainable_parameters()
 
-    print(f"Loading dataset from: {data_dir}")
+    # Verify tokenizer setup for EOS learning
+    # CRITICAL: pad_token must be different from eos_token for EOS to be learned
+    print(f"\nTokenizer setup:")
+    print(
+        f"  eos_token: {repr(model.tokenizer.eos_token)} (id={model.tokenizer.eos_token_id})"
+    )
+    print(
+        f"  pad_token: {repr(model.tokenizer.pad_token)} (id={model.tokenizer.pad_token_id})"
+    )
+    if model.tokenizer.pad_token_id == model.tokenizer.eos_token_id:
+        print(
+            "  WARNING: pad_token == eos_token! Model will NOT learn to generate EOS!"
+        )
+    else:
+        print("  OK: pad_token != eos_token - Model will learn to generate EOS")
+
+    print(f"\nLoading dataset from: {data_dir}")
     print(f"  Train split: {train_split}")
     print(f"  Val split: {val_split}")
     train_dataset = LibriSpeechDataset(
