@@ -25,8 +25,9 @@ from transformers import (
     StoppingCriteriaList,
 )
 from peft import LoraConfig, get_peft_model, TaskType
-from typing import Optional, Dict, Tuple, List
-from dataclasses import dataclass
+from typing import Optional, Dict, Tuple, List, Any
+from dataclasses import dataclass, field
+import zlib
 
 from .config import VoxLMConfig, get_config
 from .audio_encoder import AudioEncoder, AudioProjection
@@ -95,6 +96,148 @@ class ConfidenceStoppingCriteria(StoppingCriteria):
             return True
 
         return False
+
+
+@dataclass
+class TranscriptionQuality:
+    """
+    Quality metrics for a transcription (Whisper-style validation).
+
+    These metrics are encoder-agnostic and LLM-agnostic, making them
+    suitable for VoxLM's modular architecture.
+    """
+
+    text: str
+    compression_ratio: float
+    words_per_second: float
+    avg_logprob: float
+    is_valid: bool
+    failure_reasons: List[str] = field(default_factory=list)
+
+
+class TranscriptionValidator:
+    """
+    Validate transcription quality using Whisper-style metrics.
+
+    This approach is fundamentally different from per-token confidence stopping:
+    - Per-token stopping: Stops on ANY low-confidence token (breaks on rare words)
+    - Post-validation: Checks AGGREGATE quality after full generation
+
+    Works with any encoder + any LLM combination because:
+    1. compression_ratio is text-based (detects repetition/hallucination loops)
+    2. words_per_second is a language-agnostic heuristic
+    3. avg_logprob measures overall model confidence, not per-token
+
+    Reference: Whisper uses similar metrics for segment quality filtering.
+    """
+
+    def __init__(
+        self,
+        max_compression_ratio: float = 2.4,
+        min_words_per_second: float = 0.3,
+        max_words_per_second: float = 8.0,
+        min_avg_logprob: float = -1.0,
+    ):
+        """
+        Args:
+            max_compression_ratio: Text with higher ratio is likely repetitive (default 2.4, from Whisper)
+            min_words_per_second: Below this suggests missed speech (default 0.3)
+            max_words_per_second: Above this suggests hallucination (default 8.0)
+            min_avg_logprob: Below this suggests low confidence (default -1.0, from Whisper)
+        """
+        self.max_compression_ratio = max_compression_ratio
+        self.min_words_per_second = min_words_per_second
+        self.max_words_per_second = max_words_per_second
+        self.min_avg_logprob = min_avg_logprob
+
+    def compute_compression_ratio(self, text: str) -> float:
+        """
+        Compute compression ratio to detect repetitive text.
+
+        High compression ratio indicates repetitive patterns (hallucination).
+        Whisper uses threshold of 2.4.
+        """
+        if not text:
+            return 0.0
+        text_bytes = text.encode("utf-8")
+        compressed = zlib.compress(text_bytes)
+        return len(text_bytes) / len(compressed)
+
+    def compute_words_per_second(self, text: str, audio_duration: float) -> float:
+        """
+        Compute words per second as sanity check.
+
+        Typical speech: 2-4 words/second
+        > 6-8 words/second is suspicious (hallucination)
+        < 0.3 words/second for long audio is suspicious (missed speech)
+        """
+        if audio_duration <= 0:
+            return 0.0
+        word_count = len(text.split())
+        return word_count / audio_duration
+
+    def compute_avg_logprob(self, logprobs: List[float]) -> float:
+        """
+        Compute average log probability across all tokens.
+
+        Low avg_logprob suggests the model is uncertain overall.
+        Whisper uses threshold of -1.0.
+        """
+        if not logprobs:
+            return 0.0
+        return sum(logprobs) / len(logprobs)
+
+    def validate(
+        self, text: str, audio_duration: float, logprobs: Optional[List[float]] = None
+    ) -> TranscriptionQuality:
+        """
+        Validate transcription quality.
+
+        Args:
+            text: The transcribed text
+            audio_duration: Duration of audio in seconds
+            logprobs: Optional list of log probabilities for each token
+
+        Returns:
+            TranscriptionQuality with metrics and validity assessment
+        """
+        compression_ratio = self.compute_compression_ratio(text)
+        words_per_second = self.compute_words_per_second(text, audio_duration)
+        avg_logprob = self.compute_avg_logprob(logprobs) if logprobs else 0.0
+
+        failure_reasons = []
+
+        # Check compression ratio (repetition detection)
+        if compression_ratio > self.max_compression_ratio:
+            failure_reasons.append(
+                f"compression_ratio={compression_ratio:.2f} > {self.max_compression_ratio} (repetitive)"
+            )
+
+        # Check words per second (sanity check)
+        if words_per_second > self.max_words_per_second:
+            failure_reasons.append(
+                f"words_per_second={words_per_second:.2f} > {self.max_words_per_second} (too fast, likely hallucination)"
+            )
+        elif audio_duration > 2.0 and words_per_second < self.min_words_per_second:
+            # Only check min for longer audio (short audio might legitimately have few words)
+            failure_reasons.append(
+                f"words_per_second={words_per_second:.2f} < {self.min_words_per_second} (too slow, missed speech?)"
+            )
+
+        # Check average log probability (overall confidence)
+        if logprobs and avg_logprob < self.min_avg_logprob:
+            failure_reasons.append(
+                f"avg_logprob={avg_logprob:.2f} < {self.min_avg_logprob} (low confidence)"
+            )
+
+        return TranscriptionQuality(
+            text=text,
+            compression_ratio=compression_ratio,
+            words_per_second=words_per_second,
+            avg_logprob=avg_logprob,
+            is_valid=len(failure_reasons) == 0,
+            failure_reasons=failure_reasons,
+        )
 
 
 @dataclass
@@ -500,33 +643,10 @@ class VoxLM(nn.Module):
                 ignore_index=self.tokenizer.pad_token_id,
             )
 
-            # Debug output (once)
-            if not hasattr(self, "_debug_printed"):
-                pred = shift_logits.argmax(dim=-1)
-                print(f"\nDEBUG: First batch:")
-                print(f"  Labels: {shift_labels[0, :10].tolist()}")
-                print(f"  Preds:  {pred[0, :10].tolist()}")
-                print(f"  Loss: {loss.item():.4f} (expected: 8-10)")
-                self._debug_printed = True
-
             # Add alignment loss if available
             if self.config.architecture_version != "v1":
                 if alignment is not None and token_timestamps is not None:
                     mask = labels != self.tokenizer.pad_token_id
-
-                    # Debug: Print alignment info once
-                    if not hasattr(self, "_align_debug_printed"):
-                        print(f"\nDEBUG Alignment:")
-                        print(f"  alignment shape: {alignment.shape}")
-                        print(f"  num_audio_frames: {prepared['num_audio_frames']}")
-                        print(f"  token_timestamps len: {len(token_timestamps)}")
-                        if token_timestamps:
-                            print(
-                                f"  first sample timestamps len: {len(token_timestamps[0])}"
-                            )
-                            print(f"  labels shape: {labels.shape}")
-                            print(f"  mask sum (valid tokens): {mask.sum().item()}")
-                        self._align_debug_printed = True
 
                     align_loss = alignment_loss(
                         predicted=alignment,
@@ -535,12 +655,6 @@ class VoxLM(nn.Module):
                         mask=mask,
                         interp_frames=self.config.alignment_interp_frames,
                     )
-
-                    # Debug: Print alignment loss once
-                    if not hasattr(self, "_align_loss_printed"):
-                        print(f"  align_loss: {align_loss.item():.4f}")
-                        print(f"  ce_loss: {loss.item():.4f}")
-                        self._align_loss_printed = True
 
                     loss = loss + self.config.alignment_loss_weight * align_loss
 
@@ -565,22 +679,39 @@ class VoxLM(nn.Module):
         instruction: Optional[str] = None,
         max_length: Optional[int] = None,
         use_attention_timestamps: bool = False,
-        confidence_threshold: float = 0.6,
-        use_confidence_stopping: bool = True,
+        temperature: float = 0.0,
+        temperature_fallback: bool = True,
+        fallback_temperatures: Tuple[float, ...] = (0.0, 0.2, 0.4, 0.6, 0.8),
+        validate_output: bool = True,
+        return_quality: bool = False,
     ) -> Dict:
         """
         Transcribe audio to text with timestamps.
+
+        Uses Whisper-style generation strategy:
+        1. Generate with audio-duration-based max_length
+        2. Use repetition_penalty to prevent loops
+        3. Let EOS token naturally end generation
+        4. Post-validate with quality metrics (compression_ratio, words_per_second)
+        5. Retry with higher temperature if quality is poor
+
+        This approach is encoder-agnostic and LLM-agnostic, working with any
+        combination of audio encoder + LLM backbone.
 
         Args:
             audio: Raw audio waveform [samples] or [1, samples]
             instruction: Optional context instruction
             max_length: Maximum output tokens (if None, auto-calculated from audio duration)
             use_attention_timestamps: Use attention-based timestamps (v1 only)
-            confidence_threshold: Stop generation if confidence drops below this (default 0.6)
-            use_confidence_stopping: Whether to use confidence-based stopping (default True)
+            temperature: Sampling temperature (0.0 = greedy, default)
+            temperature_fallback: Whether to retry with higher temperature on poor quality
+            fallback_temperatures: Temperatures to try in order (default: Whisper-style cascade)
+            validate_output: Whether to validate output quality
+            return_quality: Whether to include quality metrics in output
 
         Returns:
-            Dict with 'text', 'words' (with timestamps and confidence)
+            Dict with 'text', 'words' (with timestamps and confidence),
+            optionally 'quality' (TranscriptionQuality)
         """
         self.eval()
 
@@ -590,12 +721,11 @@ class VoxLM(nn.Module):
         device = next(self.parameters()).device
         audio = audio.to(device)
 
-        # Auto-calculate max_length based on audio duration as a safety fallback
-        # This is a backup in case confidence stopping doesn't trigger
+        # Auto-calculate max_length based on audio duration
+        # Typical speech: 2-4 words/second, ~1.3 tokens/word = 3-6 tokens/second
+        # Use 6 tokens/second + buffer for safety
         audio_duration = audio.shape[-1] / self.config.sample_rate
-        duration_based_max = (
-            int(audio_duration * 6) + 20
-        )  # More generous with confidence stopping
+        duration_based_max = int(audio_duration * 6) + 20
 
         if max_length is None:
             max_length = duration_based_max
@@ -605,71 +735,72 @@ class VoxLM(nn.Module):
         max_length = max(max_length, 10)  # At least 10 tokens
         max_length = min(max_length, 448)  # Cap at 448
 
-        # Prepare inputs
+        # Prepare inputs (only once, reused across temperature attempts)
         prepared = self.prepare_inputs(audio, instruction)
-
-        # Cast to correct dtype
         inputs_embeds = prepared["inputs_embeds"].to(self._llm_dtype)
 
-        # Set up confidence-based stopping criteria
-        confidence_stopping = None
-        stopping_criteria = None
-        if use_confidence_stopping:
-            confidence_stopping = ConfidenceStoppingCriteria(
-                threshold=confidence_threshold,
-                min_tokens=2,
+        # Initialize validator
+        validator = TranscriptionValidator()
+
+        # Determine temperatures to try
+        if temperature_fallback:
+            temperatures = fallback_temperatures
+        else:
+            temperatures = (temperature,)
+
+        best_result = None
+        best_quality = None
+
+        for temp in temperatures:
+            # Generate with current temperature
+            generated, generated_ids, logprobs = self._generate_with_temperature(
+                inputs_embeds=inputs_embeds,
+                attention_mask=prepared["attention_mask"],
+                max_length=max_length,
+                temperature=temp,
+                use_attention_timestamps=use_attention_timestamps,
             )
-            stopping_criteria = StoppingCriteriaList([confidence_stopping])
 
-        # Generate text with scores for confidence
-        generated = self.llm.generate(
-            inputs_embeds=inputs_embeds,
-            attention_mask=prepared["attention_mask"],
-            max_new_tokens=max_length,
-            pad_token_id=self.tokenizer.pad_token_id,
-            eos_token_id=self.tokenizer.eos_token_id,
-            output_attentions=use_attention_timestamps
-            and self.config.architecture_version == "v1",
-            output_scores=True,  # Always output scores for confidence stopping
-            return_dict_in_generate=True,
-            stopping_criteria=stopping_criteria,
-            # Prevent repetition
-            repetition_penalty=1.2,
-            no_repeat_ngram_size=4,
-        )
+            # Decode text
+            text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
 
-        # Get generated token IDs
-        generated_ids = generated.sequences[0]
+            # Validate quality
+            quality = validator.validate(
+                text=text,
+                audio_duration=audio_duration,
+                logprobs=logprobs,
+            )
 
-        # Debug: Check what generate() returned
-        print(
-            f"DEBUG generate: sequences shape={generated.sequences.shape}, scores len={len(generated.scores) if generated.scores else 0}"
-        )
-        print(f"DEBUG generate: inputs_embeds shape={inputs_embeds.shape}")
-        print(f"DEBUG generate: first 5 token ids={generated_ids[:5].tolist()}")
+            # Store first result as fallback
+            if best_result is None:
+                best_result = (generated, generated_ids, text)
+                best_quality = quality
 
-        # Truncate to exclude low-confidence tokens if confidence stopping triggered
-        if confidence_stopping and confidence_stopping.stop_at_token is not None:
-            generated_ids = generated_ids[: confidence_stopping.stop_at_token]
+            # If quality is good, use this result
+            if quality.is_valid:
+                best_result = (generated, generated_ids, text)
+                best_quality = quality
+                break
 
-        # Decode text
-        text = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
+            # If this result is better (fewer failures), update best
+            if len(quality.failure_reasons) < len(best_quality.failure_reasons):
+                best_result = (generated, generated_ids, text)
+                best_quality = quality
+
+        # Use best result
+        generated, generated_ids, text = best_result
 
         # Get timestamps and confidence based on architecture version
         if self.config.architecture_version == "v2":
-            # v2: Use alignment module + DTW + token probability
             words = self._transcribe_v2(
                 audio=audio,
                 instruction=instruction,
                 generated=generated,
                 generated_ids=generated_ids,
                 prepared=prepared,
-                num_tokens_used=confidence_stopping.stop_at_token
-                if confidence_stopping and confidence_stopping.stop_at_token
-                else None,
+                num_tokens_used=None,
             )
         else:
-            # v1: Use timestamp/confidence heads or attention
             words = self._transcribe_v1(
                 audio=audio,
                 instruction=instruction,
@@ -679,11 +810,74 @@ class VoxLM(nn.Module):
                 use_attention_timestamps=use_attention_timestamps,
             )
 
-        return {
+        result = {
             "text": text,
             "words": words,
-            "audio_duration": audio.shape[-1] / self.config.sample_rate,
+            "audio_duration": audio_duration,
         }
+
+        if return_quality:
+            result["quality"] = best_quality
+
+        return result
+
+    def _generate_with_temperature(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor,
+        max_length: int,
+        temperature: float,
+        use_attention_timestamps: bool,
+    ) -> Tuple[Any, torch.Tensor, List[float]]:
+        """
+        Generate text with specified temperature.
+
+        Args:
+            inputs_embeds: Prepared input embeddings
+            attention_mask: Attention mask
+            max_length: Maximum tokens to generate
+            temperature: Sampling temperature (0.0 = greedy)
+            use_attention_timestamps: Whether to output attentions
+
+        Returns:
+            Tuple of (generated output, token IDs, log probabilities)
+        """
+        # Configure generation based on temperature
+        do_sample = temperature > 0
+
+        generated = self.llm.generate(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            max_new_tokens=max_length,
+            pad_token_id=self.tokenizer.pad_token_id,
+            eos_token_id=self.tokenizer.eos_token_id,
+            output_attentions=use_attention_timestamps
+            and self.config.architecture_version == "v1",
+            output_scores=True,
+            return_dict_in_generate=True,
+            # Temperature-based sampling
+            do_sample=do_sample,
+            temperature=temperature if do_sample else None,
+            top_p=0.95 if do_sample else None,
+            # Prevent repetition (works for both greedy and sampling)
+            repetition_penalty=1.2,
+            no_repeat_ngram_size=4,
+        )
+
+        # Get generated token IDs
+        generated_ids = generated.sequences[0]
+
+        # Compute log probabilities for quality assessment
+        logprobs = []
+        if hasattr(generated, "scores") and generated.scores:
+            for i, score in enumerate(generated.scores):
+                if i < len(generated_ids):
+                    probs = torch.softmax(score, dim=-1)
+                    token_id = generated_ids[i]
+                    logprob = torch.log(probs[0, token_id] + 1e-10).item()
+                    logprobs.append(logprob)
+
+        return generated, generated_ids, logprobs
 
     def _transcribe_v1(
         self,
@@ -795,15 +989,6 @@ class VoxLM(nn.Module):
         # This prevents DTW from using padded frames
         alignment_truncated = alignment[:, :, :actual_audio_frames]
 
-        # Debug: print truncation info once
-        if not hasattr(self, "_truncate_debug_printed"):
-            print(f"\nDEBUG Alignment truncation:")
-            print(f"  Original alignment shape: {alignment.shape}")
-            print(f"  Audio duration: {audio_duration:.2f}s")
-            print(f"  Actual audio frames: {actual_audio_frames}")
-            print(f"  Truncated alignment shape: {alignment_truncated.shape}")
-            self._truncate_debug_printed = True
-
         # Extract timestamps using DTW on truncated alignment
         word_timestamps = self.timestamp_extractor(
             alignment=alignment_truncated,
@@ -827,32 +1012,18 @@ class VoxLM(nn.Module):
             # Use generated_ids directly instead of slicing from generated.sequences.
             new_token_ids = generated_ids  # Already processed and truncated if needed
 
-            # Debug: Check shapes match
+            # Align lengths if needed - scores[i] predicts token[i]
             if len(scores) != len(new_token_ids):
-                print(
-                    f"DEBUG confidence: scores len={len(scores)}, token_ids len={len(new_token_ids)}"
-                )
-                # Align lengths - scores[i] predicts token[i]
                 min_len = min(len(scores), len(new_token_ids))
                 scores = scores[:min_len]
                 new_token_ids = new_token_ids[:min_len]
 
             if len(scores) > 0 and len(new_token_ids) > 0:
-                # Debug: print score shape and sample values
-                print(
-                    f"DEBUG: scores[0] shape={scores[0].shape}, new_token_ids shape={new_token_ids.shape}"
-                )
-
                 token_confidence = self.confidence_extractor.from_scores(
                     scores=list(scores),
                     token_ids=new_token_ids.unsqueeze(0),
                     temperature=self.config.confidence_temperature,
                 )[0]  # [seq_len]
-
-                # Debug: print confidence values
-                print(
-                    f"DEBUG: token_confidence shape={token_confidence.shape}, values={token_confidence[:5].tolist()}"
-                )
 
                 word_confidences = self.confidence_extractor.aggregate_to_words(
                     token_confidence=token_confidence,
@@ -860,9 +1031,6 @@ class VoxLM(nn.Module):
                     tokenizer=self.tokenizer,
                     aggregation=self.config.confidence_aggregation,
                 )
-
-                # Debug: print word confidences
-                print(f"DEBUG: word_confidences={word_confidences[:3]}")
 
                 # Merge timestamps and confidence
                 word_timestamps = merge_timestamps_and_confidence(
