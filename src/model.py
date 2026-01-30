@@ -46,48 +46,54 @@ from .alignment import (
 
 class ConfidenceStoppingCriteria(StoppingCriteria):
     """
-    Stop generation when consecutive tokens have low confidence.
+    Stop generation when confidence drops significantly from the running average.
 
-    This is more robust than single-token stopping:
-    - Single low-confidence token: Could be a rare but correct word (e.g., "quilter")
-    - Multiple consecutive low-confidence tokens: Likely hallucination
+    This detects the transition from high-confidence (real content) to
+    medium/low-confidence (hallucination) generation.
 
-    The model tends to become uncertain when generating beyond the audio content,
-    producing multiple low-confidence tokens in a row.
+    Strategy:
+    1. Track running average of recent high-confidence tokens
+    2. Stop when we see a significant drop from this average
+    3. Use a window of recent tokens to detect sustained confidence drop
+
+    Observed pattern:
+    - Real content: 0.95-1.0 confidence
+    - End of content: drops to 0.1-0.5
+    - Hallucination: 0.4-0.7 (medium confidence)
     """
 
     def __init__(
         self,
-        threshold: float = 0.3,
-        consecutive_required: int = 3,
-        min_tokens: int = 5,
+        drop_threshold: float = 0.5,
+        absolute_threshold: float = 0.5,
+        window_size: int = 3,
+        min_tokens: int = 10,
     ):
         """
         Args:
-            threshold: Confidence threshold (default 0.3)
-            consecutive_required: Number of consecutive low-conf tokens to trigger stop (default 3)
-            min_tokens: Don't stop before generating this many tokens (default 5)
+            drop_threshold: Stop if avg of last window drops below this fraction of peak (default 0.5)
+            absolute_threshold: Also stop if avg of last window is below this (default 0.5)
+            window_size: Number of recent tokens to average (default 3)
+            min_tokens: Don't stop before generating this many tokens (default 10)
         """
-        self.threshold = threshold
-        self.consecutive_required = consecutive_required
+        self.drop_threshold = drop_threshold
+        self.absolute_threshold = absolute_threshold
+        self.window_size = window_size
         self.min_tokens = min_tokens
         self.generated_count = 0
-        self.consecutive_low = 0
         self.stop_at_token = None
         self.confidences = []
+        self.peak_confidence = 0.0
 
     def reset(self):
         """Reset state for new generation."""
         self.generated_count = 0
-        self.consecutive_low = 0
         self.stop_at_token = None
         self.confidences = []
+        self.peak_confidence = 0.0
 
     def __call__(self, input_ids, scores, **kwargs):
         self.generated_count += 1
-
-        if self.generated_count < self.min_tokens:
-            return False
 
         if scores is None:
             return False
@@ -102,17 +108,38 @@ class ConfidenceStoppingCriteria(StoppingCriteria):
         conf = probs[0, last_token].item()
         self.confidences.append(conf)
 
-        # Track consecutive low-confidence tokens
-        if conf < self.threshold:
-            self.consecutive_low += 1
-        else:
-            self.consecutive_low = 0  # Reset on high-confidence token
+        # Track peak confidence (running max of high values)
+        if conf > 0.9:
+            self.peak_confidence = max(self.peak_confidence, conf)
 
-        # Stop if we've seen enough consecutive low-confidence tokens
-        if self.consecutive_low >= self.consecutive_required:
-            # Exclude the low-confidence tokens from output
-            self.stop_at_token = self.generated_count - self.consecutive_required
-            return True
+        # Don't stop too early
+        if self.generated_count < self.min_tokens:
+            return False
+
+        # Need enough tokens for window
+        if len(self.confidences) < self.window_size:
+            return False
+
+        # Compute average of last window
+        recent_avg = sum(self.confidences[-self.window_size :]) / self.window_size
+
+        # Stop conditions:
+        # 1. Recent average dropped significantly from peak
+        # 2. Recent average is below absolute threshold
+        if self.peak_confidence > 0.9:  # Only if we've seen high-confidence tokens
+            relative_drop = recent_avg < (self.peak_confidence * self.drop_threshold)
+            absolute_low = recent_avg < self.absolute_threshold
+
+            if relative_drop or absolute_low:
+                # Stop at the point where confidence started dropping
+                # Find the last high-confidence token
+                for i in range(len(self.confidences) - 1, -1, -1):
+                    if self.confidences[i] > 0.8:
+                        self.stop_at_token = i + 1  # Include this token
+                        break
+                else:
+                    self.stop_at_token = max(0, self.generated_count - self.window_size)
+                return True
 
         return False
 
@@ -704,15 +731,13 @@ class VoxLM(nn.Module):
         validate_output: bool = True,
         return_quality: bool = False,
         use_confidence_stopping: bool = True,
-        confidence_threshold: float = 0.3,
-        consecutive_low_confidence: int = 3,
     ) -> Dict:
         """
         Transcribe audio to text with timestamps.
 
         Uses a hybrid stopping strategy:
         1. Audio-duration-based max_length (hard cap)
-        2. Consecutive low-confidence stopping (catches hallucination early)
+        2. Confidence-drop detection (catches hallucination when confidence drops from peak)
         3. Post-validation with quality metrics
         4. Temperature fallback if quality is poor
 
@@ -729,9 +754,7 @@ class VoxLM(nn.Module):
             fallback_temperatures: Temperatures to try in order (default: Whisper-style cascade)
             validate_output: Whether to validate output quality
             return_quality: Whether to include quality metrics in output
-            use_confidence_stopping: Whether to use consecutive low-confidence stopping (default True)
-            confidence_threshold: Threshold for low confidence (default 0.3)
-            consecutive_low_confidence: Number of consecutive low-conf tokens to trigger stop (default 3)
+            use_confidence_stopping: Whether to use confidence-drop stopping (default True)
 
         Returns:
             Dict with 'text', 'words' (with timestamps and confidence),
@@ -784,8 +807,6 @@ class VoxLM(nn.Module):
                 temperature=temp,
                 use_attention_timestamps=use_attention_timestamps,
                 use_confidence_stopping=use_confidence_stopping,
-                confidence_threshold=confidence_threshold,
-                consecutive_low_confidence=consecutive_low_confidence,
             )
 
             # Decode text
@@ -856,11 +877,9 @@ class VoxLM(nn.Module):
         temperature: float,
         use_attention_timestamps: bool,
         use_confidence_stopping: bool = True,
-        confidence_threshold: float = 0.3,
-        consecutive_low_confidence: int = 3,
     ) -> Tuple[Any, torch.Tensor, List[float]]:
         """
-        Generate text with specified temperature and optional confidence stopping.
+        Generate text with specified temperature and optional confidence-drop stopping.
 
         Args:
             inputs_embeds: Prepared input embeddings
@@ -868,9 +887,7 @@ class VoxLM(nn.Module):
             max_length: Maximum tokens to generate
             temperature: Sampling temperature (0.0 = greedy)
             use_attention_timestamps: Whether to output attentions
-            use_confidence_stopping: Whether to use consecutive low-confidence stopping
-            confidence_threshold: Threshold for low confidence
-            consecutive_low_confidence: Number of consecutive low-conf tokens to trigger stop
+            use_confidence_stopping: Whether to use confidence-drop stopping
 
         Returns:
             Tuple of (generated output, token IDs, log probabilities)
@@ -879,13 +896,16 @@ class VoxLM(nn.Module):
         do_sample = temperature > 0
 
         # Set up confidence-based stopping criteria
+        # Uses confidence-drop detection: stops when recent confidence drops
+        # significantly from the peak (indicates transition to hallucination)
         confidence_stopping = None
         stopping_criteria = None
         if use_confidence_stopping:
             confidence_stopping = ConfidenceStoppingCriteria(
-                threshold=confidence_threshold,
-                consecutive_required=consecutive_low_confidence,
-                min_tokens=5,
+                drop_threshold=0.5,  # Stop if recent avg < 50% of peak
+                absolute_threshold=0.5,  # Or if recent avg < 0.5
+                window_size=3,  # Average over last 3 tokens
+                min_tokens=10,  # Don't stop before 10 tokens
             )
             stopping_criteria = StoppingCriteriaList([confidence_stopping])
 
