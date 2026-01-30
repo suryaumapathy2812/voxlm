@@ -137,10 +137,10 @@ Audio Input (16kHz)
 ## Citation
 
 ```bibtex
-@misc{voxlm2024,
+@misc{voxlm2026,
   title={VoxLM: Modular Speech-to-Text with LLM Intelligence},
   author={Surya Umapathy},
-  year={2024},
+  year={2026},
   url={https://github.com/suryaumapathy2812/voxlm}
 }
 ```
