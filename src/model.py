@@ -135,14 +135,14 @@ class TranscriptionValidator:
         self,
         max_compression_ratio: float = 2.4,
         min_words_per_second: float = 0.3,
-        max_words_per_second: float = 8.0,
+        max_words_per_second: float = 5.0,
         min_avg_logprob: float = -1.0,
     ):
         """
         Args:
             max_compression_ratio: Text with higher ratio is likely repetitive (default 2.4, from Whisper)
             min_words_per_second: Below this suggests missed speech (default 0.3)
-            max_words_per_second: Above this suggests hallucination (default 8.0)
+            max_words_per_second: Above this suggests hallucination (default 5.0, typical speech is 2-4 wps)
             min_avg_logprob: Below this suggests low confidence (default -1.0, from Whisper)
         """
         self.max_compression_ratio = max_compression_ratio
@@ -722,10 +722,10 @@ class VoxLM(nn.Module):
         audio = audio.to(device)
 
         # Auto-calculate max_length based on audio duration
-        # Typical speech: 2-4 words/second, ~1.3 tokens/word = 3-6 tokens/second
-        # Use 6 tokens/second + buffer for safety
+        # Typical speech: 2-4 words/second, ~1.3 tokens/word = 2.6-5.2 tokens/second
+        # Use 4 tokens/second + small buffer (conservative to prevent hallucination)
         audio_duration = audio.shape[-1] / self.config.sample_rate
-        duration_based_max = int(audio_duration * 6) + 20
+        duration_based_max = int(audio_duration * 4) + 10
 
         if max_length is None:
             max_length = duration_based_max
