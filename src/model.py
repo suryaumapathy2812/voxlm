@@ -46,28 +46,40 @@ from .alignment import (
 
 class ConfidenceStoppingCriteria(StoppingCriteria):
     """
-    Stop generation when token confidence drops below threshold.
+    Stop generation when consecutive tokens have low confidence.
 
-    This detects hallucination by monitoring when the model becomes
-    uncertain about what to generate next (indicating it's moved beyond
-    the actual audio content).
+    This is more robust than single-token stopping:
+    - Single low-confidence token: Could be a rare but correct word (e.g., "quilter")
+    - Multiple consecutive low-confidence tokens: Likely hallucination
+
+    The model tends to become uncertain when generating beyond the audio content,
+    producing multiple low-confidence tokens in a row.
     """
 
-    def __init__(self, threshold: float = 0.6, min_tokens: int = 2):
+    def __init__(
+        self,
+        threshold: float = 0.3,
+        consecutive_required: int = 3,
+        min_tokens: int = 5,
+    ):
         """
         Args:
-            threshold: Stop if confidence drops below this (default 0.6)
-            min_tokens: Don't stop before generating this many tokens
+            threshold: Confidence threshold (default 0.3)
+            consecutive_required: Number of consecutive low-conf tokens to trigger stop (default 3)
+            min_tokens: Don't stop before generating this many tokens (default 5)
         """
         self.threshold = threshold
+        self.consecutive_required = consecutive_required
         self.min_tokens = min_tokens
         self.generated_count = 0
+        self.consecutive_low = 0
         self.stop_at_token = None
         self.confidences = []
 
     def reset(self):
         """Reset state for new generation."""
         self.generated_count = 0
+        self.consecutive_low = 0
         self.stop_at_token = None
         self.confidences = []
 
@@ -90,9 +102,16 @@ class ConfidenceStoppingCriteria(StoppingCriteria):
         conf = probs[0, last_token].item()
         self.confidences.append(conf)
 
-        # Stop if confidence drops below threshold
+        # Track consecutive low-confidence tokens
         if conf < self.threshold:
-            self.stop_at_token = self.generated_count - 1  # Exclude low-conf token
+            self.consecutive_low += 1
+        else:
+            self.consecutive_low = 0  # Reset on high-confidence token
+
+        # Stop if we've seen enough consecutive low-confidence tokens
+        if self.consecutive_low >= self.consecutive_required:
+            # Exclude the low-confidence tokens from output
+            self.stop_at_token = self.generated_count - self.consecutive_required
             return True
 
         return False
@@ -684,16 +703,18 @@ class VoxLM(nn.Module):
         fallback_temperatures: Tuple[float, ...] = (0.0, 0.2, 0.4, 0.6, 0.8),
         validate_output: bool = True,
         return_quality: bool = False,
+        use_confidence_stopping: bool = True,
+        confidence_threshold: float = 0.3,
+        consecutive_low_confidence: int = 3,
     ) -> Dict:
         """
         Transcribe audio to text with timestamps.
 
-        Uses Whisper-style generation strategy:
-        1. Generate with audio-duration-based max_length
-        2. Use repetition_penalty to prevent loops
-        3. Let EOS token naturally end generation
-        4. Post-validate with quality metrics (compression_ratio, words_per_second)
-        5. Retry with higher temperature if quality is poor
+        Uses a hybrid stopping strategy:
+        1. Audio-duration-based max_length (hard cap)
+        2. Consecutive low-confidence stopping (catches hallucination early)
+        3. Post-validation with quality metrics
+        4. Temperature fallback if quality is poor
 
         This approach is encoder-agnostic and LLM-agnostic, working with any
         combination of audio encoder + LLM backbone.
@@ -708,6 +729,9 @@ class VoxLM(nn.Module):
             fallback_temperatures: Temperatures to try in order (default: Whisper-style cascade)
             validate_output: Whether to validate output quality
             return_quality: Whether to include quality metrics in output
+            use_confidence_stopping: Whether to use consecutive low-confidence stopping (default True)
+            confidence_threshold: Threshold for low confidence (default 0.3)
+            consecutive_low_confidence: Number of consecutive low-conf tokens to trigger stop (default 3)
 
         Returns:
             Dict with 'text', 'words' (with timestamps and confidence),
@@ -759,6 +783,9 @@ class VoxLM(nn.Module):
                 max_length=max_length,
                 temperature=temp,
                 use_attention_timestamps=use_attention_timestamps,
+                use_confidence_stopping=use_confidence_stopping,
+                confidence_threshold=confidence_threshold,
+                consecutive_low_confidence=consecutive_low_confidence,
             )
 
             # Decode text
@@ -828,9 +855,12 @@ class VoxLM(nn.Module):
         max_length: int,
         temperature: float,
         use_attention_timestamps: bool,
+        use_confidence_stopping: bool = True,
+        confidence_threshold: float = 0.3,
+        consecutive_low_confidence: int = 3,
     ) -> Tuple[Any, torch.Tensor, List[float]]:
         """
-        Generate text with specified temperature.
+        Generate text with specified temperature and optional confidence stopping.
 
         Args:
             inputs_embeds: Prepared input embeddings
@@ -838,12 +868,26 @@ class VoxLM(nn.Module):
             max_length: Maximum tokens to generate
             temperature: Sampling temperature (0.0 = greedy)
             use_attention_timestamps: Whether to output attentions
+            use_confidence_stopping: Whether to use consecutive low-confidence stopping
+            confidence_threshold: Threshold for low confidence
+            consecutive_low_confidence: Number of consecutive low-conf tokens to trigger stop
 
         Returns:
             Tuple of (generated output, token IDs, log probabilities)
         """
         # Configure generation based on temperature
         do_sample = temperature > 0
+
+        # Set up confidence-based stopping criteria
+        confidence_stopping = None
+        stopping_criteria = None
+        if use_confidence_stopping:
+            confidence_stopping = ConfidenceStoppingCriteria(
+                threshold=confidence_threshold,
+                consecutive_required=consecutive_low_confidence,
+                min_tokens=5,
+            )
+            stopping_criteria = StoppingCriteriaList([confidence_stopping])
 
         generated = self.llm.generate(
             inputs_embeds=inputs_embeds,
@@ -855,6 +899,7 @@ class VoxLM(nn.Module):
             and self.config.architecture_version == "v1",
             output_scores=True,
             return_dict_in_generate=True,
+            stopping_criteria=stopping_criteria,
             # Temperature-based sampling
             do_sample=do_sample,
             temperature=temperature if do_sample else None,
@@ -866,6 +911,10 @@ class VoxLM(nn.Module):
 
         # Get generated token IDs
         generated_ids = generated.sequences[0]
+
+        # Truncate if confidence stopping triggered
+        if confidence_stopping and confidence_stopping.stop_at_token is not None:
+            generated_ids = generated_ids[: confidence_stopping.stop_at_token]
 
         # Compute log probabilities for quality assessment
         logprobs = []
