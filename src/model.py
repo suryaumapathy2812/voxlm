@@ -318,8 +318,14 @@ class VoxLM(nn.Module):
         # This ensures EOS tokens in the training labels contribute to the loss,
         # teaching the model to generate EOS when transcription is complete.
         if self.tokenizer.pad_token_id == self.tokenizer.eos_token_id:
-            # Use fim_pad token which exists in Qwen2 tokenizers (ID 151662)
-            self.tokenizer.pad_token = "<|fim_pad|>"
+            # Use fim_pad token which exists in Qwen2 tokenizers
+            fim_pad_id = self.tokenizer.convert_tokens_to_ids("<|fim_pad|>")
+            if fim_pad_id is not None:
+                self.tokenizer.pad_token = "<|fim_pad|>"
+                self.tokenizer.pad_token_id = fim_pad_id
+            else:
+                # Fallback: add a new pad token if fim_pad doesn't exist
+                self.tokenizer.add_special_tokens({"pad_token": "<|pad|>"})
 
         # Add special tokens
         special_tokens = {
