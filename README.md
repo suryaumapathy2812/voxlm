@@ -1,5 +1,9 @@
 # VoxLM: Modular Speech-to-Text with LLM Intelligence
 
+[![Hugging Face](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-voxlm--2b-blue)](https://huggingface.co/suryaumapathy2812/voxlm-2b)
+[![License](https://img.shields.io/badge/License-Apache%202.0-green.svg)](https://opensource.org/licenses/Apache-2.0)
+[![WER](https://img.shields.io/badge/WER-6.69%25-brightgreen)](https://huggingface.co/suryaumapathy2812/voxlm-2b)
+
 > **Any Audio Encoder + Any LLM = Intelligent Transcription with Word-Level Timestamps**
 
 VoxLM is a modular ASR architecture that combines any audio encoder (Whisper, IndicWhisper, MMS) with any LLM backbone (Qwen, Llama, Phi, Gemma) to produce intelligent, context-aware transcriptions with precise word-level timestamps and calibrated confidence scores.
@@ -31,7 +35,7 @@ VoxLM is a modular ASR architecture that combines any audio encoder (Whisper, In
 
 ```bash
 # Clone the repository
-git clone https://github.com/your-repo/voxlm.git
+git clone https://github.com/suryaumapathy2812/voxlm.git
 cd voxlm
 
 # Option 1: Using uv (recommended)
@@ -44,6 +48,16 @@ pip install -e .
 pip install torch torchaudio transformers peft accelerate soundfile openai-whisper librosa tqdm pyyaml
 ```
 
+### Download from HuggingFace
+
+```bash
+# Using hf CLI
+uvx hf download suryaumapathy2812/voxlm-2b model.pt --local-dir ./models/voxlm-2b/
+
+# Or using huggingface_hub
+python -c "from huggingface_hub import hf_hub_download; hf_hub_download('suryaumapathy2812/voxlm-2b', 'model.pt', local_dir='./models/voxlm-2b/')"
+```
+
 ### Inference
 
 ```python
@@ -51,11 +65,11 @@ from src.model import VoxLM
 from src.config import get_config
 import torch
 
-# Load model
-config = get_config("voxlm-2b")
-model = VoxLM(config)
-model.load_state_dict(torch.load("checkpoints/voxlm-2b/best.pt")["model_state_dict"])
-model = model.to("cuda").eval()
+# Load model (from HuggingFace download)
+checkpoint = torch.load("models/voxlm-2b/model.pt", map_location="cuda")
+model = VoxLM(checkpoint["config"]).to("cuda")
+model.load_state_dict(checkpoint["model_state_dict"])
+model.eval()
 
 # Transcribe
 result = model.transcribe(
@@ -317,7 +331,7 @@ from src import QwenSTT, QwenSTTConfig  # Aliases to VoxLM, VoxLMConfig
 
 ## License
 
-MIT
+Apache 2.0
 
 ## Acknowledgments
 
