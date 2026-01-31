@@ -279,6 +279,9 @@ class VoxLMForConditionalGeneration(VoxLM, PreTrainedModel):
         from pathlib import Path
         import os
         
+        # Remove trust_remote_code from kwargs to avoid duplicate argument error
+        kwargs.pop('trust_remote_code', None)
+        
         # Load config
         config = AutoConfig.from_pretrained(
             pretrained_model_name_or_path,
