@@ -253,23 +253,24 @@ from .configuration_voxlm import VoxLMConfig
 # =============================================================================
 
 
-class VoxLMForConditionalGeneration(VoxLM, PreTrainedModel):
+class VoxLMForConditionalGeneration(PreTrainedModel):
     """
     HuggingFace-compatible wrapper for VoxLM.
+    
+    Uses composition (not inheritance) to avoid MRO issues with multiple inheritance.
     
     Enables loading with:
         model = AutoModel.from_pretrained("repo/voxlm-2b", trust_remote_code=True)
     """
     
     config_class = VoxLMConfig
-    base_model_prefix = "voxlm"
+    base_model_prefix = "model"
     supports_gradient_checkpointing = False
     
     def __init__(self, config: VoxLMConfig):
-        # Initialize PreTrainedModel first
-        PreTrainedModel.__init__(self, config)
-        # Then initialize VoxLM
-        VoxLM.__init__(self, config)
+        super().__init__(config)
+        # Use composition: VoxLM as a submodule
+        self.model = VoxLM(config)
     
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
@@ -292,7 +293,7 @@ class VoxLMForConditionalGeneration(VoxLM, PreTrainedModel):
         # Create model
         model = cls(config)
         
-        # Load weights
+        # Load weights - load directly into inner model (self.model)
         model_path = Path(pretrained_model_name_or_path)
         if model_path.is_dir():
             # Local directory
@@ -301,13 +302,14 @@ class VoxLMForConditionalGeneration(VoxLM, PreTrainedModel):
             
             if safetensors_path.exists():
                 state_dict = load_file(str(safetensors_path))
-                model.load_state_dict(state_dict, strict=False)
+                model.model.load_state_dict(state_dict, strict=False)
             elif pt_path.exists():
                 checkpoint = torch.load(str(pt_path), map_location="cpu", weights_only=False)
                 if "model_state_dict" in checkpoint:
-                    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+                    state_dict = checkpoint["model_state_dict"]
                 else:
-                    model.load_state_dict(checkpoint, strict=False)
+                    state_dict = checkpoint
+                model.model.load_state_dict(state_dict, strict=False)
         else:
             # HuggingFace Hub
             from huggingface_hub import hf_hub_download
@@ -318,7 +320,6 @@ class VoxLMForConditionalGeneration(VoxLM, PreTrainedModel):
                     "model.safetensors"
                 )
                 state_dict = load_file(safetensors_path)
-                model.load_state_dict(state_dict, strict=False)
             except Exception:
                 pt_path = hf_hub_download(
                     pretrained_model_name_or_path,
@@ -326,11 +327,18 @@ class VoxLMForConditionalGeneration(VoxLM, PreTrainedModel):
                 )
                 checkpoint = torch.load(pt_path, map_location="cpu", weights_only=False)
                 if "model_state_dict" in checkpoint:
-                    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
+                    state_dict = checkpoint["model_state_dict"]
                 else:
-                    model.load_state_dict(checkpoint, strict=False)
+                    state_dict = checkpoint
+            
+            # Load directly into inner model
+            model.model.load_state_dict(state_dict, strict=False)
         
         return model
+    
+    def forward(self, *args, **kwargs):
+        """Forward pass delegates to inner VoxLM model."""
+        return self.model(*args, **kwargs)
     
     def generate(
         self,
@@ -353,12 +361,16 @@ class VoxLMForConditionalGeneration(VoxLM, PreTrainedModel):
         Returns:
             Dict with 'text', 'words' (timestamps and confidence)
         """
-        return self.transcribe(
+        return self.model.transcribe(
             audio=audio,
             instruction=instruction,
             max_length=max_new_tokens,
             **kwargs
         )
+    
+    def transcribe(self, *args, **kwargs):
+        """Convenience method that delegates to inner model."""
+        return self.model.transcribe(*args, **kwargs)
 
 
 # Alias for AutoModel registration
