@@ -61,21 +61,23 @@ python -c "from huggingface_hub import hf_hub_download; hf_hub_download('suryaum
 ### Inference
 
 ```python
-from src.model import VoxLM
-from src.config import get_config
 import torch
+import soundfile as sf
+from src.model import VoxLM
 
-# Load model (from HuggingFace download)
-checkpoint = torch.load("models/voxlm-2b/model.pt", map_location="cuda")
+# 1. Load model from HuggingFace download
+checkpoint = torch.load("models/voxlm-2b/model.pt", map_location="cuda", weights_only=False)
 model = VoxLM(checkpoint["config"]).to("cuda")
 model.load_state_dict(checkpoint["model_state_dict"])
 model.eval()
 
-# Transcribe
-result = model.transcribe(
-    audio=audio_tensor,  # [samples] @ 16kHz
-    instruction="Clear English speech."
-)
+# 2. Load audio (16kHz)
+audio, sr = sf.read("audio.wav")
+audio_tensor = torch.from_numpy(audio).float().to("cuda")
+
+# 3. Transcribe
+with torch.no_grad():
+    result = model.transcribe(audio_tensor)
 
 print(result["text"])
 # "hello world"

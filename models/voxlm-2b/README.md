@@ -68,22 +68,39 @@ Total parameters: ~1.86B (230M trainable via LoRA)
 
 ## Usage
 
+### Option 1: With VoxLM Repository (Recommended)
+
+```bash
+# 1. Clone the repository
+git clone https://github.com/suryaumapathy2812/voxlm.git
+cd voxlm
+
+# 2. Install dependencies
+pip install -e .
+# Or: uv sync
+
+# 3. Download model
+pip install huggingface_hub
+python -c "from huggingface_hub import hf_hub_download; hf_hub_download('suryaumapathy2812/voxlm-2b', 'model.pt', local_dir='./models/voxlm-2b/')"
+```
+
 ```python
+# 4. Run inference
 import torch
+import soundfile as sf
 from src.model import VoxLM
-from src.config import get_config
 
 # Load model
-checkpoint = torch.load("model.pt", map_location="cuda")
+checkpoint = torch.load("models/voxlm-2b/model.pt", map_location="cuda", weights_only=False)
 model = VoxLM(checkpoint["config"]).to("cuda")
 model.load_state_dict(checkpoint["model_state_dict"])
 model.eval()
 
-# Transcribe
-import soundfile as sf
+# Load audio (16kHz)
 audio, sr = sf.read("audio.wav")
 audio_tensor = torch.from_numpy(audio).float().to("cuda")
 
+# Transcribe
 with torch.no_grad():
     result = model.transcribe(audio_tensor)
 
@@ -95,6 +112,28 @@ print(result["words"])
 #   {"word": "hello", "start": 0.0, "end": 0.5, "confidence": 0.98},
 #   {"word": "world", "start": 0.5, "end": 1.0, "confidence": 0.95}
 # ]
+```
+
+### Option 2: With AutoModel (Coming Soon)
+
+```python
+# After HuggingFace integration is complete:
+from transformers import AutoModel
+import torch
+import soundfile as sf
+
+# Load model directly from HuggingFace
+model = AutoModel.from_pretrained(
+    "suryaumapathy2812/voxlm-2b",
+    trust_remote_code=True
+).to("cuda")
+
+# Load audio and transcribe
+audio, sr = sf.read("audio.wav")
+result = model.generate(torch.from_numpy(audio).float().to("cuda"))
+
+print(result["text"])
+print(result["words"])
 ```
 
 ## Architecture
