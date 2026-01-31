@@ -577,11 +577,13 @@ def convert_checkpoint(
     try:
         from safetensors.torch import save_file
 
-        # Filter out non-tensor items and convert to contiguous
+        # Filter out non-tensor items, clone to break shared memory, and convert to contiguous
+        # This is needed because some tensors share memory (e.g., whisper.encoder == encoder, embed_tokens == lm_head)
         tensor_dict = {}
         for k, v in state_dict.items():
             if isinstance(v, torch.Tensor):
-                tensor_dict[k] = v.contiguous()
+                # Clone to break shared memory references
+                tensor_dict[k] = v.clone().contiguous()
 
         save_file(tensor_dict, output_path / "model.safetensors")
         print(f"Created: {output_path / 'model.safetensors'}")
