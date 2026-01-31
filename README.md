@@ -324,6 +324,7 @@ from src import QwenSTT, QwenSTTConfig  # Aliases to VoxLM, VoxLMConfig
 
 ## Future Work
 
+- [ ] **Filler word detection** ("uh", "um", pauses) - Train on conversational speech (Switchboard, Fisher)
 - [ ] Multilingual benchmarks (FLEURS, CommonVoice)
 - [ ] Translation (Tamil audio -> English text)
 - [ ] Code-switching (mixed-language speech)
